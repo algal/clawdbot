@@ -75,6 +75,17 @@ type SystemWhichParams = {
   bins: string[];
 };
 
+type FileGetParams = {
+  path: string;
+  maxBytes?: number;
+};
+
+type FileGetResult = {
+  base64: string;
+  mimeType: string;
+  size: number;
+};
+
 type BrowserProxyParams = {
   method?: string;
   path?: string;
@@ -149,6 +160,12 @@ type NodeInvokeRequestPayload = {
 const OUTPUT_CAP = 200_000;
 const OUTPUT_EVENT_TAIL = 20_000;
 const DEFAULT_NODE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const FILE_GET_DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
+// Note: node.invoke results are transported over the gateway WebSocket as JSON (base64 payload).
+// The gateway server caps incoming frame size (MAX_PAYLOAD_BYTES) very aggressively, so large
+// base64 payloads will be rejected. Keep a conservative cap here to fail early with a clear error.
+// (base64 adds ~33% overhead, plus JSON framing).
+const FILE_GET_MAX_WIRE_BYTES = 320 * 1024;
 const BROWSER_PROXY_MAX_FILE_BYTES = 10 * 1024 * 1024;
 
 const execHostEnforced = process.env.OPENCLAW_NODE_EXEC_HOST?.trim().toLowerCase() === "app";
@@ -604,6 +621,7 @@ export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
     commands: [
       "system.run",
       "system.which",
+      "file.get",
       "system.execApprovals.get",
       "system.execApprovals.set",
       ...(browserProxyEnabled ? ["browser.proxy"] : []),
@@ -725,6 +743,63 @@ async function handleInvoke(
       }
       const env = sanitizeEnv(undefined);
       const payload = await handleSystemWhich(params, env);
+      await sendInvokeResult(client, frame, {
+        ok: true,
+        payloadJSON: JSON.stringify(payload),
+      });
+    } catch (err) {
+      await sendInvokeResult(client, frame, {
+        ok: false,
+        error: { code: "INVALID_REQUEST", message: String(err) },
+      });
+    }
+    return;
+  }
+
+  if (command === "file.get") {
+    try {
+      const params = decodeParams<FileGetParams>(frame.paramsJSON);
+      const filePath = typeof params.path === "string" ? params.path.trim() : "";
+      if (!filePath) {
+        throw new Error("INVALID_REQUEST: path required");
+      }
+      if (!path.isAbsolute(filePath)) {
+        throw new Error("INVALID_REQUEST: path must be absolute");
+      }
+      const requestedMaxBytes =
+        typeof params.maxBytes === "number" && Number.isFinite(params.maxBytes)
+          ? Math.max(0, Math.floor(params.maxBytes))
+          : FILE_GET_DEFAULT_MAX_BYTES;
+      const maxBytes = Math.min(requestedMaxBytes, FILE_GET_MAX_WIRE_BYTES);
+      const stat = await fsPromises.stat(filePath).catch(() => null);
+      if (!stat || !stat.isFile()) {
+        throw new Error("INVALID_REQUEST: file not found");
+      }
+      if (stat.size > maxBytes) {
+        const transportHint =
+          requestedMaxBytes > FILE_GET_MAX_WIRE_BYTES
+            ? ` (requestedMaxBytes=${requestedMaxBytes} transportMaxBytes=${FILE_GET_MAX_WIRE_BYTES})`
+            : "";
+        throw new Error(
+          `INVALID_REQUEST: file too large (size=${stat.size} maxBytes=${maxBytes})${transportHint}`,
+        );
+      }
+      const buffer = await fsPromises.readFile(filePath);
+      if (buffer.length > maxBytes) {
+        const transportHint =
+          requestedMaxBytes > FILE_GET_MAX_WIRE_BYTES
+            ? ` (requestedMaxBytes=${requestedMaxBytes} transportMaxBytes=${FILE_GET_MAX_WIRE_BYTES})`
+            : "";
+        throw new Error(
+          `INVALID_REQUEST: file too large (size=${buffer.length} maxBytes=${maxBytes})${transportHint}`,
+        );
+      }
+      const mimeType = (await detectMime({ buffer, filePath })) ?? "application/octet-stream";
+      const payload: FileGetResult = {
+        base64: buffer.toString("base64"),
+        mimeType,
+        size: buffer.length,
+      };
       await sendInvokeResult(client, frame, {
         ok: true,
         payloadJSON: JSON.stringify(payload),

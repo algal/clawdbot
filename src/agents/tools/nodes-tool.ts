@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import os from "node:os";
+import path from "node:path";
 
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import { Type } from "@sinclair/typebox";
@@ -18,7 +20,7 @@ import {
 } from "../../cli/nodes-screen.js";
 import { parseDurationMs } from "../../cli/parse-duration.js";
 import type { OpenClawConfig } from "../../config/config.js";
-import { imageMimeFromFormat } from "../../media/mime.js";
+import { extensionForMime, imageMimeFromFormat } from "../../media/mime.js";
 import { resolveSessionAgentId } from "../agent-scope.js";
 import { optionalStringEnum, stringEnum } from "../schema/typebox.js";
 import { sanitizeToolResultImages } from "../tool-images.js";
@@ -37,6 +39,7 @@ const NODES_TOOL_ACTIONS = [
   "camera_list",
   "camera_clip",
   "screen_record",
+  "file_get",
   "location_get",
   "run",
 ] as const;
@@ -45,6 +48,15 @@ const NOTIFY_PRIORITIES = ["passive", "active", "timeSensitive"] as const;
 const NOTIFY_DELIVERIES = ["system", "overlay", "auto"] as const;
 const CAMERA_FACING = ["front", "back", "both"] as const;
 const LOCATION_ACCURACY = ["coarse", "balanced", "precise"] as const;
+
+function fileGetTempPath(params: { mimeType?: string; sourcePath?: string }) {
+  const id = crypto.randomUUID();
+  const byMime = extensionForMime(params.mimeType ?? undefined);
+  const byName = params.sourcePath ? path.extname(params.sourcePath) : "";
+  const extRaw = byMime ?? byName;
+  const ext = /^\.[a-z0-9]+$/i.test(extRaw) ? extRaw : "";
+  return path.join(os.tmpdir(), `openclaw-file-get-${id}${ext}`);
+}
 
 // Flattened schema: runtime validates per-action requirements.
 const NodesToolSchema = Type.Object({
@@ -75,6 +87,9 @@ const NodesToolSchema = Type.Object({
   fps: Type.Optional(Type.Number()),
   screenIndex: Type.Optional(Type.Number()),
   outPath: Type.Optional(Type.String()),
+  // file_get
+  path: Type.Optional(Type.String()),
+  maxBytes: Type.Optional(Type.Number()),
   // location_get
   maxAgeMs: Type.Optional(Type.Number()),
   locationTimeoutMs: Type.Optional(Type.Number()),
@@ -352,6 +367,52 @@ export function createNodesTool(options?: {
                 fps: payload.fps,
                 screenIndex: payload.screenIndex,
                 hasAudio: payload.hasAudio,
+              },
+            };
+          }
+          case "file_get": {
+            const node = readStringParam(params, "node", { required: true });
+            const nodeId = await resolveNodeId(gatewayOpts, node);
+            const requestedPath = readStringParam(params, "path", { required: true });
+            const maxBytes =
+              typeof params.maxBytes === "number" && Number.isFinite(params.maxBytes)
+                ? params.maxBytes
+                : undefined;
+            const raw = (await callGatewayTool("node.invoke", gatewayOpts, {
+              nodeId,
+              command: "file.get",
+              params: {
+                path: requestedPath,
+                maxBytes,
+              },
+              idempotencyKey: crypto.randomUUID(),
+            })) as { payload?: unknown };
+            const payload =
+              raw && typeof raw.payload === "object" && raw.payload !== null
+                ? (raw.payload as Record<string, unknown>)
+                : {};
+            const base64 = typeof payload.base64 === "string" ? payload.base64 : "";
+            const mimeType =
+              typeof payload.mimeType === "string" && payload.mimeType.trim()
+                ? payload.mimeType.trim()
+                : "application/octet-stream";
+            const size =
+              typeof payload.size === "number" && Number.isFinite(payload.size)
+                ? payload.size
+                : undefined;
+            if (!base64) {
+              throw new Error("invalid file.get payload (base64 missing)");
+            }
+            const filePath = fileGetTempPath({ mimeType, sourcePath: requestedPath });
+            const written = await writeBase64ToFile(filePath, base64);
+            return {
+              content: [{ type: "text", text: `FILE:${written.path}` }],
+              details: {
+                node: nodeId,
+                sourcePath: requestedPath,
+                path: written.path,
+                mimeType,
+                size: size ?? written.bytes,
               },
             };
           }

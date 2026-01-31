@@ -39,6 +39,7 @@ import {
   startBrowserControlServiceFromConfig,
 } from "../browser/control-service.js";
 import { createBrowserRouteDispatcher } from "../browser/routes/dispatcher.js";
+import { getImageMetadata, resizeToJpeg, resizeToPng } from "../media/image-ops.js";
 import { detectMime } from "../media/mime.js";
 import { resolveAgentConfig } from "../agents/agent-scope.js";
 import { ensureOpenClawCliOnPath } from "../infra/path-env.js";
@@ -93,6 +94,13 @@ type BrowserProxyFile = {
 type BrowserProxyResult = {
   result: unknown;
   files?: BrowserProxyFile[];
+};
+
+type ScreenSnapParams = {
+  screenIndex?: number | null;
+  format?: string | null;
+  quality?: number | null;
+  maxWidth?: number | null;
 };
 
 type SystemExecApprovalsSetParams = {
@@ -606,6 +614,7 @@ export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
       "system.which",
       "system.execApprovals.get",
       "system.execApprovals.set",
+      "screen.snap",
       ...(browserProxyEnabled ? ["browser.proxy"] : []),
     ],
     pathEnv,
@@ -844,6 +853,102 @@ async function handleInvoke(
         ok: false,
         error: { code: "INVALID_REQUEST", message: String(err) },
       });
+    }
+    return;
+  }
+
+  if (command === "screen.snap") {
+    if (process.platform !== "darwin") {
+      await sendInvokeResult(client, frame, {
+        ok: false,
+        error: { code: "UNAVAILABLE", message: "screen.snap is only supported on macOS" },
+      });
+      return;
+    }
+
+    let tmpPath: string | null = null;
+    try {
+      const params = decodeParams<ScreenSnapParams>(frame.paramsJSON);
+      const rawFormat = typeof params.format === "string" ? params.format.trim().toLowerCase() : "";
+      const normalizedFormat = rawFormat || "png";
+      if (normalizedFormat !== "png" && normalizedFormat !== "jpg" && normalizedFormat !== "jpeg") {
+        throw new Error("INVALID_REQUEST: format must be png or jpg");
+      }
+      const format = normalizedFormat === "png" ? "png" : "jpg";
+      const quality =
+        typeof params.quality === "number" && Number.isFinite(params.quality)
+          ? Math.max(1, Math.min(100, Math.round(params.quality)))
+          : 85;
+      const maxWidth =
+        typeof params.maxWidth === "number" && Number.isFinite(params.maxWidth)
+          ? Math.max(1, Math.round(params.maxWidth))
+          : undefined;
+      const screenIndexRaw =
+        typeof params.screenIndex === "number" && Number.isFinite(params.screenIndex)
+          ? Math.floor(params.screenIndex)
+          : undefined;
+      if (screenIndexRaw !== undefined && screenIndexRaw < 0) {
+        throw new Error("INVALID_REQUEST: screenIndex must be >= 0");
+      }
+
+      tmpPath = path.join("/tmp", `openclaw-screen-${crypto.randomUUID()}.png`);
+      const timeoutMs =
+        typeof frame.timeoutMs === "number" && Number.isFinite(frame.timeoutMs)
+          ? Math.max(1, Math.floor(frame.timeoutMs))
+          : 20_000;
+      const env = { ...process.env, PATH: ensureNodePathEnv() } as Record<string, string>;
+      const bin = resolveExecutable("screencapture", env) ?? "/usr/sbin/screencapture";
+      const args = ["-x"];
+      if (screenIndexRaw !== undefined) {
+        args.push("-D", String(screenIndexRaw + 1));
+      }
+      args.push(tmpPath);
+      const capture = await runCommand([bin, ...args], undefined, env, timeoutMs);
+      if (!capture.success) {
+        const detail = [capture.error, capture.stderr, capture.stdout].filter(Boolean).join(" ");
+        throw new Error(
+          `screencapture failed${capture.exitCode !== undefined ? ` (exit ${capture.exitCode})` : ""}${detail ? `: ${detail}` : ""}`,
+        );
+      }
+
+      let buffer: Buffer = Buffer.from(await fsPromises.readFile(tmpPath));
+      const meta = await getImageMetadata(buffer);
+      if (format === "jpg") {
+        const maxSide =
+          maxWidth ?? (meta ? Math.max(meta.width, meta.height) : undefined) ?? 10_000;
+        buffer = await resizeToJpeg({
+          buffer,
+          maxSide,
+          quality,
+          withoutEnlargement: true,
+        });
+      } else if (maxWidth) {
+        buffer = await resizeToPng({
+          buffer,
+          maxSide: maxWidth,
+          withoutEnlargement: true,
+        });
+      }
+
+      const finalMeta = await getImageMetadata(buffer);
+      await sendInvokeResult(client, frame, {
+        ok: true,
+        payloadJSON: JSON.stringify({
+          format,
+          base64: buffer.toString("base64"),
+          width: finalMeta?.width,
+          height: finalMeta?.height,
+        }),
+      });
+    } catch (err) {
+      await sendInvokeResult(client, frame, {
+        ok: false,
+        error: { code: "INVALID_REQUEST", message: String(err) },
+      });
+    } finally {
+      if (tmpPath) {
+        await fsPromises.rm(tmpPath, { force: true }).catch(() => {});
+      }
     }
     return;
   }

@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import os from "node:os";
+import path from "node:path";
 
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import { Type } from "@sinclair/typebox";
@@ -36,6 +38,7 @@ const NODES_TOOL_ACTIONS = [
   "camera_snap",
   "camera_list",
   "camera_clip",
+  "screen_snap",
   "screen_record",
   "location_get",
   "run",
@@ -44,6 +47,7 @@ const NODES_TOOL_ACTIONS = [
 const NOTIFY_PRIORITIES = ["passive", "active", "timeSensitive"] as const;
 const NOTIFY_DELIVERIES = ["system", "overlay", "auto"] as const;
 const CAMERA_FACING = ["front", "back", "both"] as const;
+const SCREEN_SNAP_FORMATS = ["png", "jpg", "jpeg"] as const;
 const LOCATION_ACCURACY = ["coarse", "balanced", "precise"] as const;
 
 // Flattened schema: runtime validates per-action requirements.
@@ -60,18 +64,19 @@ const NodesToolSchema = Type.Object({
   sound: Type.Optional(Type.String()),
   priority: optionalStringEnum(NOTIFY_PRIORITIES),
   delivery: optionalStringEnum(NOTIFY_DELIVERIES),
-  // camera_snap / camera_clip
+  // camera_snap / camera_clip / screen_snap
   facing: optionalStringEnum(CAMERA_FACING, {
     description: "camera_snap: front/back/both; camera_clip: front/back only.",
   }),
   maxWidth: Type.Optional(Type.Number()),
   quality: Type.Optional(Type.Number()),
+  format: optionalStringEnum(SCREEN_SNAP_FORMATS),
   delayMs: Type.Optional(Type.Number()),
   deviceId: Type.Optional(Type.String()),
   duration: Type.Optional(Type.String()),
   durationMs: Type.Optional(Type.Number()),
   includeAudio: Type.Optional(Type.Boolean()),
-  // screen_record
+  // screen_record / screen_snap
   fps: Type.Optional(Type.Number()),
   screenIndex: Type.Optional(Type.Number()),
   outPath: Type.Optional(Type.String()),
@@ -246,6 +251,88 @@ export function createNodesTool(options?: {
 
             const result: AgentToolResult<unknown> = { content, details };
             return await sanitizeToolResultImages(result, "nodes:camera_snap");
+          }
+          case "screen_snap": {
+            const node = readStringParam(params, "node", { required: true });
+            const nodeId = await resolveNodeId(gatewayOpts, node);
+            const rawFormat =
+              typeof params.format === "string" ? params.format.trim().toLowerCase() : "png";
+            const format =
+              rawFormat === "jpg" || rawFormat === "jpeg"
+                ? "jpg"
+                : rawFormat === "png"
+                  ? "png"
+                  : (() => {
+                      throw new Error("invalid format (png|jpg)");
+                    })();
+            const maxWidth =
+              typeof params.maxWidth === "number" && Number.isFinite(params.maxWidth)
+                ? params.maxWidth
+                : undefined;
+            const quality =
+              typeof params.quality === "number" && Number.isFinite(params.quality)
+                ? params.quality
+                : undefined;
+            const screenIndex =
+              typeof params.screenIndex === "number" && Number.isFinite(params.screenIndex)
+                ? params.screenIndex
+                : undefined;
+
+            const raw = (await callGatewayTool("node.invoke", gatewayOpts, {
+              nodeId,
+              command: "screen.snap",
+              params: {
+                screenIndex,
+                format,
+                quality,
+                maxWidth,
+              },
+              idempotencyKey: crypto.randomUUID(),
+            })) as { payload?: unknown };
+
+            const payload =
+              raw && typeof raw.payload === "object" && raw.payload !== null ? raw.payload : {};
+            const payloadRecord = payload as Record<string, unknown>;
+            const payloadFormat =
+              typeof payloadRecord.format === "string"
+                ? String(payloadRecord.format).toLowerCase()
+                : "";
+            const base64 =
+              typeof payloadRecord.base64 === "string" ? String(payloadRecord.base64) : "";
+            if (!payloadFormat || !base64) {
+              throw new Error("invalid screen.snap payload");
+            }
+            const isJpeg = payloadFormat === "jpg" || payloadFormat === "jpeg";
+            if (!isJpeg && payloadFormat !== "png") {
+              throw new Error(`unsupported screen.snap format: ${payloadFormat}`);
+            }
+            const filePath = path.join(
+              os.tmpdir(),
+              `openclaw-screen-snap-${crypto.randomUUID()}.${isJpeg ? "jpg" : "png"}`,
+            );
+            await writeBase64ToFile(filePath, base64);
+            const width = typeof payloadRecord.width === "number" ? payloadRecord.width : undefined;
+            const height =
+              typeof payloadRecord.height === "number" ? payloadRecord.height : undefined;
+
+            const result: AgentToolResult<unknown> = {
+              content: [
+                { type: "text", text: `MEDIA:${filePath}` },
+                {
+                  type: "image",
+                  data: base64,
+                  mimeType:
+                    imageMimeFromFormat(payloadFormat) ?? (isJpeg ? "image/jpeg" : "image/png"),
+                },
+              ],
+              details: {
+                path: filePath,
+                screenIndex,
+                width,
+                height,
+              },
+            };
+            return await sanitizeToolResultImages(result, "nodes:screen_snap");
           }
           case "camera_list": {
             const node = readStringParam(params, "node", { required: true });

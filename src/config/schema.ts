@@ -211,6 +211,8 @@ const FIELD_LABELS: Record<string, string> = {
   "gateway.nodes.denyCommands": "Gateway Node Denylist",
   "nodeHost.browserProxy.enabled": "Node Browser Proxy Enabled",
   "nodeHost.browserProxy.allowProfiles": "Node Browser Proxy Allowed Profiles",
+  "nodeHost.fileGet.allowPaths": "Node File Get Allowed Paths",
+  "nodeHost.fileGet.denyPaths": "Node File Get Denied Paths",
   "skills.load.watch": "Watch Skills",
   "skills.load.watchDebounceMs": "Skills Watch Debounce (ms)",
   "agents.defaults.workspace": "Workspace",
@@ -402,6 +404,10 @@ const FIELD_HELP: Record<string, string> = {
   "nodeHost.browserProxy.enabled": "Expose the local browser control server via node proxy.",
   "nodeHost.browserProxy.allowProfiles":
     "Optional allowlist of browser profile names exposed via the node proxy.",
+  "nodeHost.fileGet.allowPaths":
+    "Allowlist of absolute path patterns for file.get (glob: *, **, ?). Default: deny all.",
+  "nodeHost.fileGet.denyPaths":
+    "Optional denylist of absolute path patterns for file.get (deny wins over allow).",
   "diagnostics.flags":
     'Enable targeted diagnostics logs by flag (e.g. ["telegram.http"]). Supports wildcards like "telegram.*" or "*".',
   "diagnostics.cacheTrace.enabled":

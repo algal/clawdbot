@@ -376,7 +376,24 @@ describe("file-get e2e", () => {
     { timeout: E2E_TIMEOUT_MS },
     async () => {
       gw = await spawnGatewayInstance("file-get");
+
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-e2e-file-get-"));
+      const filePath = path.join(tmpDir, "hello.txt");
+      const content = `hello from e2e ${randomUUID()}\n`;
+      await fs.writeFile(filePath, content, "utf8");
+
       nodeHomeDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-e2e-node-host-"));
+      const nodeConfigDir = path.join(nodeHomeDir, ".openclaw");
+      await fs.mkdir(nodeConfigDir, { recursive: true });
+      const nodeConfigPath = path.join(nodeConfigDir, "openclaw.json");
+      const nodeConfig = {
+        nodeHost: {
+          fileGet: {
+            allowPaths: [`${tmpDir}/**`],
+          },
+        },
+      };
+      await fs.writeFile(nodeConfigPath, `${JSON.stringify(nodeConfig, null, 2)}\n`, "utf8");
 
       const nodeStdout: string[] = [];
       const nodeStderr: string[] = [];
@@ -399,6 +416,8 @@ describe("file-get e2e", () => {
           env: {
             ...process.env,
             HOME: nodeHomeDir,
+            OPENCLAW_CONFIG_PATH: nodeConfigPath,
+            OPENCLAW_STATE_DIR: nodeConfigDir,
             OPENCLAW_GATEWAY_TOKEN: gw.gatewayToken,
             OPENCLAW_GATEWAY_PASSWORD: "",
             OPENCLAW_SKIP_CHANNELS: "1",
@@ -421,11 +440,6 @@ describe("file-get e2e", () => {
         procStderr: nodeStderr,
       });
       await waitForNodeStatus(gw, nodeId, 20_000);
-
-      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-e2e-file-get-"));
-      const filePath = path.join(tmpDir, "hello.txt");
-      const content = `hello from e2e ${randomUUID()}\n`;
-      await fs.writeFile(filePath, content, "utf8");
 
       const result = (await runCliJson(
         [
@@ -458,6 +472,28 @@ describe("file-get e2e", () => {
       const decoded = Buffer.from(result.payload?.base64 ?? "", "base64").toString("utf8");
       expect(decoded).toBe(content);
       expect(result.payload?.size).toBe(Buffer.byteLength(content, "utf8"));
+
+      const denied = await runCli(
+        [
+          "nodes",
+          "invoke",
+          "--json",
+          "--url",
+          `ws://127.0.0.1:${gw.port}`,
+          "--node",
+          nodeId,
+          "--command",
+          "file.get",
+          "--params",
+          JSON.stringify({ path: process.execPath }),
+        ],
+        {
+          OPENCLAW_GATEWAY_TOKEN: gw.gatewayToken,
+          OPENCLAW_GATEWAY_PASSWORD: "",
+        },
+      );
+      expect(denied.code).not.toBe(0);
+      expect(`${denied.stdout}\n${denied.stderr}`).toMatch(/FILE_GET_DENIED/);
 
       const toolRes = await runToolsInvoke<{
         ok?: boolean;

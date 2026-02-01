@@ -23,6 +23,13 @@ const NodeHostSchema = z
       })
       .strict()
       .optional(),
+    fileGet: z
+      .object({
+        allowPaths: z.array(z.string()).optional(),
+        denyPaths: z.array(z.string()).optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .optional();

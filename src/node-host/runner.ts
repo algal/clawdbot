@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import {
@@ -255,6 +256,97 @@ function sanitizeEnv(
 
 function normalizeProfileAllowlist(raw?: string[]): string[] {
   return Array.isArray(raw) ? raw.map((entry) => entry.trim()).filter(Boolean) : [];
+}
+
+function normalizePathPatterns(raw?: unknown): string[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw.map((entry) => (typeof entry === "string" ? entry.trim() : "")).filter(Boolean);
+}
+
+function expandHome(value: string): string {
+  if (!value) {
+    return value;
+  }
+  if (value === "~") {
+    return os.homedir();
+  }
+  if (value.startsWith("~/")) {
+    return path.join(os.homedir(), value.slice(2));
+  }
+  return value;
+}
+
+function normalizeMatchTarget(value: string): string {
+  if (process.platform === "win32") {
+    const stripped = value.replace(/^\\\\[?.]\\/, "");
+    return stripped.replace(/\\/g, "/").toLowerCase();
+  }
+  return value.replace(/\\\\/g, "/");
+}
+
+function globToRegExp(pattern: string, params?: { caseInsensitive?: boolean }): RegExp {
+  let regex = "^";
+  let i = 0;
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === "*") {
+      const next = pattern[i + 1];
+      if (next === "*") {
+        regex += ".*";
+        i += 2;
+        continue;
+      }
+      regex += "[^/]*";
+      i += 1;
+      continue;
+    }
+    if (ch === "?") {
+      regex += ".";
+      i += 1;
+      continue;
+    }
+    regex += ch.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&");
+    i += 1;
+  }
+  regex += "$";
+  return new RegExp(regex, params?.caseInsensitive ? "i" : undefined);
+}
+
+function tryRealpath(value: string): string | null {
+  try {
+    return fs.realpathSync(value);
+  } catch {
+    return null;
+  }
+}
+
+function matchesPathPattern(patternRaw: string, targetPath: string): boolean {
+  const trimmed = patternRaw.trim();
+  if (!trimmed) {
+    return false;
+  }
+  const expanded = trimmed.startsWith("~") ? expandHome(trimmed) : trimmed;
+  const hasWildcard = /[*?]/.test(expanded);
+  let normalizedPattern = expanded;
+  let normalizedTarget = targetPath;
+  if (process.platform === "win32" && !hasWildcard) {
+    normalizedPattern = tryRealpath(expanded) ?? expanded;
+    normalizedTarget = tryRealpath(targetPath) ?? targetPath;
+  }
+  normalizedPattern = normalizeMatchTarget(normalizedPattern);
+  normalizedTarget = normalizeMatchTarget(normalizedTarget);
+  const caseInsensitive = process.platform === "win32";
+  return globToRegExp(normalizedPattern, { caseInsensitive }).test(normalizedTarget);
+}
+
+function resolveFileGetPolicy() {
+  const cfg = loadConfig();
+  const fileGet = cfg.nodeHost?.fileGet;
+  const allowPaths = normalizePathPatterns(fileGet?.allowPaths);
+  const denyPaths = normalizePathPatterns(fileGet?.denyPaths);
+  return { allowPaths, denyPaths };
 }
 
 function resolveBrowserProxyConfig() {
@@ -766,12 +858,53 @@ async function handleInvoke(
       if (!path.isAbsolute(filePath)) {
         throw new Error("INVALID_REQUEST: path must be absolute");
       }
+      const policy = resolveFileGetPolicy();
+      if (policy.allowPaths.length === 0) {
+        throw new Error(
+          "INVALID_REQUEST: FILE_GET_DISABLED (nodeHost.fileGet.allowPaths is empty)",
+        );
+      }
+
+      // Enforce allow/deny policy against the request path first (avoid probing existence outside
+      // configured allowPaths), then enforce again on the canonical path to avoid symlink escapes.
+      if (policy.denyPaths.some((pattern) => matchesPathPattern(pattern, filePath))) {
+        throw new Error(
+          "INVALID_REQUEST: FILE_GET_DENIED (path denied by nodeHost.fileGet.denyPaths)",
+        );
+      }
+      if (!policy.allowPaths.some((pattern) => matchesPathPattern(pattern, filePath))) {
+        const debug =
+          process.env.VITEST || process.env.NODE_ENV === "test"
+            ? ` requested=${filePath} allowPaths=${JSON.stringify(policy.allowPaths)}`
+            : "";
+        throw new Error(
+          `INVALID_REQUEST: FILE_GET_DENIED (path not allowed by nodeHost.fileGet.allowPaths)${debug}`,
+        );
+      }
+      const realPath = await fsPromises.realpath(filePath).catch(() => null);
+      if (!realPath) {
+        throw new Error("INVALID_REQUEST: file not found");
+      }
+      if (policy.denyPaths.some((pattern) => matchesPathPattern(pattern, realPath))) {
+        throw new Error(
+          "INVALID_REQUEST: FILE_GET_DENIED (path denied by nodeHost.fileGet.denyPaths)",
+        );
+      }
+      if (!policy.allowPaths.some((pattern) => matchesPathPattern(pattern, realPath))) {
+        const debug =
+          process.env.VITEST || process.env.NODE_ENV === "test"
+            ? ` requested=${filePath} real=${realPath} allowPaths=${JSON.stringify(policy.allowPaths)}`
+            : "";
+        throw new Error(
+          `INVALID_REQUEST: FILE_GET_DENIED (path not allowed by nodeHost.fileGet.allowPaths)${debug}`,
+        );
+      }
       const requestedMaxBytes =
         typeof params.maxBytes === "number" && Number.isFinite(params.maxBytes)
           ? Math.max(0, Math.floor(params.maxBytes))
           : FILE_GET_DEFAULT_MAX_BYTES;
       const maxBytes = Math.min(requestedMaxBytes, FILE_GET_MAX_WIRE_BYTES);
-      const stat = await fsPromises.stat(filePath).catch(() => null);
+      const stat = await fsPromises.stat(realPath).catch(() => null);
       if (!stat || !stat.isFile()) {
         throw new Error("INVALID_REQUEST: file not found");
       }
@@ -784,7 +917,7 @@ async function handleInvoke(
           `INVALID_REQUEST: file too large (size=${stat.size} maxBytes=${maxBytes})${transportHint}`,
         );
       }
-      const buffer = await fsPromises.readFile(filePath);
+      const buffer = await fsPromises.readFile(realPath);
       if (buffer.length > maxBytes) {
         const transportHint =
           requestedMaxBytes > FILE_GET_MAX_WIRE_BYTES

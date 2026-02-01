@@ -265,6 +265,14 @@ function normalizePathPatterns(raw?: unknown): string[] {
   return raw.map((entry) => (typeof entry === "string" ? entry.trim() : "")).filter(Boolean);
 }
 
+function trimTrailingSeparators(value: string): string {
+  let out = value;
+  while (out.length > 1 && (out.endsWith("/") || out.endsWith("\\"))) {
+    out = out.slice(0, -1);
+  }
+  return out;
+}
+
 function expandHome(value: string): string {
   if (!value) {
     return value;
@@ -322,17 +330,48 @@ function tryRealpath(value: string): string | null {
   }
 }
 
+function canonicalizePathPattern(patternRaw: string): string {
+  const trimmed = patternRaw.trim();
+  if (!trimmed) {
+    return trimmed;
+  }
+  const expanded = trimmed.startsWith("~") ? expandHome(trimmed) : trimmed;
+  const wildcardIndex = expanded.search(/[*?]/);
+  if (wildcardIndex === -1) {
+    return tryRealpath(expanded) ?? expanded;
+  }
+
+  // For wildcard patterns, resolve symlinks in the literal prefix (up to the last path separator
+  // before the wildcard). This keeps matching consistent with realpath(requested) while still
+  // preventing symlink escapes (we match against the request's realpath).
+  const prefixRaw = expanded.slice(0, wildcardIndex);
+  const lastSep = Math.max(prefixRaw.lastIndexOf("/"), prefixRaw.lastIndexOf("\\"));
+  if (lastSep === -1) {
+    return expanded;
+  }
+  const prefixCandidate = trimTrailingSeparators(expanded.slice(0, Math.max(1, lastSep)));
+  if (!prefixCandidate) {
+    return expanded;
+  }
+  const resolvedPrefix = tryRealpath(prefixCandidate);
+  if (!resolvedPrefix) {
+    return expanded;
+  }
+  const suffix = expanded.slice(prefixCandidate.length);
+  return `${resolvedPrefix}${suffix}`;
+}
+
 function matchesPathPattern(patternRaw: string, targetPath: string): boolean {
   const trimmed = patternRaw.trim();
   if (!trimmed) {
     return false;
   }
-  const expanded = trimmed.startsWith("~") ? expandHome(trimmed) : trimmed;
-  const hasWildcard = /[*?]/.test(expanded);
-  let normalizedPattern = expanded;
+  const canonical = canonicalizePathPattern(trimmed);
+  const hasWildcard = /[*?]/.test(canonical);
+  let normalizedPattern = canonical;
   let normalizedTarget = targetPath;
   if (process.platform === "win32" && !hasWildcard) {
-    normalizedPattern = tryRealpath(expanded) ?? expanded;
+    normalizedPattern = tryRealpath(canonical) ?? canonical;
     normalizedTarget = tryRealpath(targetPath) ?? targetPath;
   }
   normalizedPattern = normalizeMatchTarget(normalizedPattern);
@@ -344,9 +383,11 @@ function matchesPathPattern(patternRaw: string, targetPath: string): boolean {
 function resolveFileGetPolicy() {
   const cfg = loadConfig();
   const fileGet = cfg.nodeHost?.fileGet;
-  const allowPaths = normalizePathPatterns(fileGet?.allowPaths);
-  const denyPaths = normalizePathPatterns(fileGet?.denyPaths);
-  return { allowPaths, denyPaths };
+  const allowPathsRaw = normalizePathPatterns(fileGet?.allowPaths);
+  const denyPathsRaw = normalizePathPatterns(fileGet?.denyPaths);
+  const allowPaths = allowPathsRaw.map(canonicalizePathPattern).filter(Boolean);
+  const denyPaths = denyPathsRaw.map(canonicalizePathPattern).filter(Boolean);
+  return { allowPathsRaw, denyPathsRaw, allowPaths, denyPaths };
 }
 
 function resolveBrowserProxyConfig() {
@@ -859,28 +900,13 @@ async function handleInvoke(
         throw new Error("INVALID_REQUEST: path must be absolute");
       }
       const policy = resolveFileGetPolicy();
-      if (policy.allowPaths.length === 0) {
+      if (policy.allowPathsRaw.length === 0) {
         throw new Error(
           "INVALID_REQUEST: FILE_GET_DISABLED (nodeHost.fileGet.allowPaths is empty)",
         );
       }
 
-      // Enforce allow/deny policy against the request path first (avoid probing existence outside
-      // configured allowPaths), then enforce again on the canonical path to avoid symlink escapes.
-      if (policy.denyPaths.some((pattern) => matchesPathPattern(pattern, filePath))) {
-        throw new Error(
-          "INVALID_REQUEST: FILE_GET_DENIED (path denied by nodeHost.fileGet.denyPaths)",
-        );
-      }
-      if (!policy.allowPaths.some((pattern) => matchesPathPattern(pattern, filePath))) {
-        const debug =
-          process.env.VITEST || process.env.NODE_ENV === "test"
-            ? ` requested=${filePath} allowPaths=${JSON.stringify(policy.allowPaths)}`
-            : "";
-        throw new Error(
-          `INVALID_REQUEST: FILE_GET_DENIED (path not allowed by nodeHost.fileGet.allowPaths)${debug}`,
-        );
-      }
+      // Enforce allow/deny policy against the canonical path to avoid symlink escapes.
       const realPath = await fsPromises.realpath(filePath).catch(() => null);
       if (!realPath) {
         throw new Error("INVALID_REQUEST: file not found");
@@ -893,7 +919,7 @@ async function handleInvoke(
       if (!policy.allowPaths.some((pattern) => matchesPathPattern(pattern, realPath))) {
         const debug =
           process.env.VITEST || process.env.NODE_ENV === "test"
-            ? ` requested=${filePath} real=${realPath} allowPaths=${JSON.stringify(policy.allowPaths)}`
+            ? ` requested=${filePath} real=${realPath} allowPaths=${JSON.stringify(policy.allowPathsRaw)}`
             : "";
         throw new Error(
           `INVALID_REQUEST: FILE_GET_DENIED (path not allowed by nodeHost.fileGet.allowPaths)${debug}`,

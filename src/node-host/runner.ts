@@ -265,6 +265,30 @@ function normalizePathPatterns(raw?: unknown): string[] {
   return raw.map((entry) => (typeof entry === "string" ? entry.trim() : "")).filter(Boolean);
 }
 
+function hasParentTraversalSegment(value: string): boolean {
+  if (!value) {
+    return false;
+  }
+  return value
+    .split(/[\\/]+/g)
+    .map((segment) => segment.trim())
+    .some((segment) => segment === "..");
+}
+
+function isAbsolutePathPattern(patternRaw: string): boolean {
+  const trimmed = patternRaw.trim();
+  if (!trimmed) {
+    return false;
+  }
+  const expanded = trimmed.startsWith("~") ? expandHome(trimmed) : trimmed;
+  // `path.isAbsolute` treats `/`-prefixed patterns as absolute even if they contain globs.
+  if (path.isAbsolute(expanded)) {
+    return true;
+  }
+  // Windows drive paths (also covers patterns like `C:\\Users\\**`).
+  return /^[A-Za-z]:[\\/]/.test(expanded);
+}
+
 function trimTrailingSeparators(value: string): string {
   let out = value;
   while (out.length > 1 && (out.endsWith("/") || out.endsWith("\\"))) {
@@ -380,11 +404,30 @@ function matchesPathPattern(patternRaw: string, targetPath: string): boolean {
   return globToRegExp(normalizedPattern, { caseInsensitive }).test(normalizedTarget);
 }
 
+function matchesPathPatternUncanonicalized(patternRaw: string, targetPath: string): boolean {
+  const trimmed = patternRaw.trim();
+  if (!trimmed) {
+    return false;
+  }
+  const expanded = trimmed.startsWith("~") ? expandHome(trimmed) : trimmed;
+  const hasWildcard = /[*?]/.test(expanded);
+  let normalizedPattern = expanded;
+  let normalizedTarget = targetPath;
+  if (process.platform === "win32" && !hasWildcard) {
+    normalizedPattern = tryRealpath(expanded) ?? expanded;
+    normalizedTarget = tryRealpath(targetPath) ?? targetPath;
+  }
+  normalizedPattern = normalizeMatchTarget(normalizedPattern);
+  normalizedTarget = normalizeMatchTarget(normalizedTarget);
+  const caseInsensitive = process.platform === "win32";
+  return globToRegExp(normalizedPattern, { caseInsensitive }).test(normalizedTarget);
+}
+
 function resolveFileGetPolicy() {
   const cfg = loadConfig();
   const fileGet = cfg.nodeHost?.fileGet;
-  const allowPathsRaw = normalizePathPatterns(fileGet?.allowPaths);
-  const denyPathsRaw = normalizePathPatterns(fileGet?.denyPaths);
+  const allowPathsRaw = normalizePathPatterns(fileGet?.allowPaths).filter(isAbsolutePathPattern);
+  const denyPathsRaw = normalizePathPatterns(fileGet?.denyPaths).filter(isAbsolutePathPattern);
   const allowPaths = allowPathsRaw.map(canonicalizePathPattern).filter(Boolean);
   const denyPaths = denyPathsRaw.map(canonicalizePathPattern).filter(Boolean);
   return { allowPathsRaw, denyPathsRaw, allowPaths, denyPaths };
@@ -438,6 +481,36 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs?: number, label?: s
     if (timer) {
       clearTimeout(timer);
     }
+  }
+}
+
+async function readFileUpToBytes(filePath: string, maxBytes: number): Promise<Buffer> {
+  const limit = Math.max(0, Math.floor(maxBytes));
+  const fh = await fsPromises.open(filePath, "r");
+  try {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let position = 0;
+    while (total <= limit) {
+      const toRead = Math.min(64 * 1024, limit - total + 1);
+      const buf = Buffer.allocUnsafe(toRead);
+      const { bytesRead } = await fh.read(buf, 0, toRead, position);
+      if (!bytesRead) {
+        break;
+      }
+      chunks.push(buf.subarray(0, bytesRead));
+      total += bytesRead;
+      position += bytesRead;
+      if (total > limit) {
+        break;
+      }
+    }
+    if (total > limit) {
+      throw new Error(`file too large (size>${limit})`);
+    }
+    return chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, total);
+  } finally {
+    await fh.close().catch(() => {});
   }
 }
 
@@ -899,6 +972,10 @@ async function handleInvoke(
       if (!path.isAbsolute(filePath)) {
         throw new Error("INVALID_REQUEST: path must be absolute");
       }
+      if (hasParentTraversalSegment(filePath)) {
+        throw new Error("INVALID_REQUEST: path must not contain '..'");
+      }
+      const resolvedPath = path.resolve(filePath);
       const policy = resolveFileGetPolicy();
       if (policy.allowPathsRaw.length === 0) {
         throw new Error(
@@ -906,8 +983,29 @@ async function handleInvoke(
         );
       }
 
+      // Privacy/security: do not leak existence for paths outside the configured allowlist.
+      // Check against the raw patterns first (no realpath probing).
+      if (
+        policy.denyPathsRaw.some((pattern) =>
+          matchesPathPatternUncanonicalized(pattern, resolvedPath),
+        )
+      ) {
+        throw new Error(
+          "INVALID_REQUEST: FILE_GET_DENIED (path denied by nodeHost.fileGet.denyPaths)",
+        );
+      }
+      if (
+        !policy.allowPathsRaw.some((pattern) =>
+          matchesPathPatternUncanonicalized(pattern, resolvedPath),
+        )
+      ) {
+        throw new Error(
+          "INVALID_REQUEST: FILE_GET_DENIED (path not allowed by nodeHost.fileGet.allowPaths)",
+        );
+      }
+
       // Enforce allow/deny policy against the canonical path to avoid symlink escapes.
-      const realPath = await fsPromises.realpath(filePath).catch(() => null);
+      const realPath = await fsPromises.realpath(resolvedPath).catch(() => null);
       if (!realPath) {
         throw new Error("INVALID_REQUEST: file not found");
       }
@@ -943,17 +1041,21 @@ async function handleInvoke(
           `INVALID_REQUEST: file too large (size=${stat.size} maxBytes=${maxBytes})${transportHint}`,
         );
       }
-      const buffer = await fsPromises.readFile(realPath);
-      if (buffer.length > maxBytes) {
-        const transportHint =
-          requestedMaxBytes > FILE_GET_MAX_WIRE_BYTES
-            ? ` (requestedMaxBytes=${requestedMaxBytes} transportMaxBytes=${FILE_GET_MAX_WIRE_BYTES})`
-            : "";
-        throw new Error(
-          `INVALID_REQUEST: file too large (size=${buffer.length} maxBytes=${maxBytes})${transportHint}`,
-        );
-      }
-      const mimeType = (await detectMime({ buffer, filePath })) ?? "application/octet-stream";
+      const buffer = await readFileUpToBytes(realPath, maxBytes).catch((err) => {
+        const message = String(err);
+        if (message.includes("file too large")) {
+          const transportHint =
+            requestedMaxBytes > FILE_GET_MAX_WIRE_BYTES
+              ? ` (requestedMaxBytes=${requestedMaxBytes} transportMaxBytes=${FILE_GET_MAX_WIRE_BYTES})`
+              : "";
+          throw new Error(
+            `INVALID_REQUEST: file too large (size>${maxBytes} maxBytes=${maxBytes})${transportHint}`,
+          );
+        }
+        throw err;
+      });
+      const mimeType =
+        (await detectMime({ buffer, filePath: realPath })) ?? "application/octet-stream";
       const payload: FileGetResult = {
         base64: buffer.toString("base64"),
         mimeType,

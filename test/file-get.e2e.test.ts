@@ -495,6 +495,28 @@ describe("file-get e2e", () => {
       expect(denied.code).not.toBe(0);
       expect(`${denied.stdout}\n${denied.stderr}`).toMatch(/FILE_GET_DENIED/);
 
+      const traversal = await runCli(
+        [
+          "nodes",
+          "invoke",
+          "--json",
+          "--url",
+          `ws://127.0.0.1:${gw.port}`,
+          "--node",
+          nodeId,
+          "--command",
+          "file.get",
+          "--params",
+          JSON.stringify({ path: `${filePath}/../secret.txt` }),
+        ],
+        {
+          OPENCLAW_GATEWAY_TOKEN: gw.gatewayToken,
+          OPENCLAW_GATEWAY_PASSWORD: "",
+        },
+      );
+      expect(traversal.code).not.toBe(0);
+      expect(`${traversal.stdout}\n${traversal.stderr}`).toMatch(/path must not contain '\.\.'/i);
+
       const toolRes = await runToolsInvoke<{
         ok?: boolean;
         result?: { content?: Array<{ type?: string; text?: string }>; details?: unknown };

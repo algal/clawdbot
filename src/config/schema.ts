@@ -211,6 +211,9 @@ const FIELD_LABELS: Record<string, string> = {
   "gateway.nodes.denyCommands": "Gateway Node Denylist",
   "nodeHost.browserProxy.enabled": "Node Browser Proxy Enabled",
   "nodeHost.browserProxy.allowProfiles": "Node Browser Proxy Allowed Profiles",
+  "nodeHost.screenSnap.maxWidth": "Node Screen Snap Max Width",
+  "nodeHost.screenSnap.maxQuality": "Node Screen Snap Max Quality",
+  "nodeHost.screenSnap.maxBytes": "Node Screen Snap Max Bytes",
   "skills.load.watch": "Watch Skills",
   "skills.load.watchDebounceMs": "Skills Watch Debounce (ms)",
   "agents.defaults.workspace": "Workspace",
@@ -402,6 +405,12 @@ const FIELD_HELP: Record<string, string> = {
   "nodeHost.browserProxy.enabled": "Expose the local browser control server via node proxy.",
   "nodeHost.browserProxy.allowProfiles":
     "Optional allowlist of browser profile names exposed via the node proxy.",
+  "nodeHost.screenSnap.maxWidth":
+    "Maximum width in pixels for screenshots (default: 1920). Larger screenshots are resized to fit.",
+  "nodeHost.screenSnap.maxQuality":
+    "JPEG quality for screenshots (1-100, default: 85). Lower values reduce file size.",
+  "nodeHost.screenSnap.maxBytes":
+    "Maximum screenshot size in bytes (default: 320KB). Screenshots exceeding this limit will be rejected.",
   "diagnostics.flags":
     'Enable targeted diagnostics logs by flag (e.g. ["telegram.http"]). Supports wildcards like "telegram.*" or "*".',
   "diagnostics.cacheTrace.enabled":

@@ -158,6 +158,11 @@ const OUTPUT_CAP = 200_000;
 const OUTPUT_EVENT_TAIL = 20_000;
 const DEFAULT_NODE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const BROWSER_PROXY_MAX_FILE_BYTES = 10 * 1024 * 1024;
+// Note: node.invoke results are transported over the gateway WebSocket as JSON (base64 payload).
+// The gateway server caps incoming frame size (MAX_PAYLOAD_BYTES) very aggressively, so large
+// base64 payloads will be rejected. Keep a conservative cap here to fail early with a clear error.
+// (base64 adds ~33% overhead, plus JSON framing).
+const SCREEN_SNAP_MAX_WIRE_BYTES = 320 * 1024;
 
 const execHostEnforced = process.env.OPENCLAW_NODE_EXEC_HOST?.trim().toLowerCase() === "app";
 const execHostFallbackAllowed =
@@ -254,6 +259,16 @@ function resolveBrowserProxyConfig() {
   const allowProfiles = normalizeProfileAllowlist(proxy?.allowProfiles);
   const enabled = proxy?.enabled !== false;
   return { enabled, allowProfiles };
+}
+
+function resolveScreenSnapConfig() {
+  const cfg = loadConfig();
+  const screenSnap = cfg.nodeHost?.screenSnap;
+  return {
+    maxWidth: screenSnap?.maxWidth ?? 1920,
+    maxQuality: screenSnap?.maxQuality ?? 85,
+    maxBytes: screenSnap?.maxBytes ?? SCREEN_SNAP_MAX_WIRE_BYTES,
+  };
 }
 
 let browserControlReady: Promise<void> | null = null;
@@ -875,14 +890,18 @@ async function handleInvoke(
         throw new Error("INVALID_REQUEST: format must be png or jpg");
       }
       const format = normalizedFormat === "png" ? "png" : "jpg";
+
+      // Get configuration with defaults
+      const config = resolveScreenSnapConfig();
+
       const quality =
         typeof params.quality === "number" && Number.isFinite(params.quality)
           ? Math.max(1, Math.min(100, Math.round(params.quality)))
-          : 85;
+          : config.maxQuality;
       const maxWidth =
         typeof params.maxWidth === "number" && Number.isFinite(params.maxWidth)
           ? Math.max(1, Math.round(params.maxWidth))
-          : undefined;
+          : config.maxWidth;
       const screenIndexRaw =
         typeof params.screenIndex === "number" && Number.isFinite(params.screenIndex)
           ? Math.floor(params.screenIndex)
@@ -914,20 +933,28 @@ async function handleInvoke(
       let buffer: Buffer = Buffer.from(await fsPromises.readFile(tmpPath));
       const meta = await getImageMetadata(buffer);
       if (format === "jpg") {
-        const maxSide =
-          maxWidth ?? (meta ? Math.max(meta.width, meta.height) : undefined) ?? 10_000;
         buffer = await resizeToJpeg({
           buffer,
-          maxSide,
+          maxSide: maxWidth,
           quality,
           withoutEnlargement: true,
         });
-      } else if (maxWidth) {
+      } else {
+        // Always resize PNG to maxWidth to ensure reasonable size
         buffer = await resizeToPng({
           buffer,
           maxSide: maxWidth,
           withoutEnlargement: true,
         });
+      }
+
+      // Validate size before transmission
+      if (buffer.length > config.maxBytes) {
+        throw new Error(
+          `Screenshot size (${buffer.length} bytes) exceeds transport limit (${config.maxBytes} bytes). ` +
+            `Try: 1) Using JPEG format with lower quality, 2) Setting maxWidth to reduce resolution, ` +
+            `3) Capturing a smaller screen area`,
+        );
       }
 
       const finalMeta = await getImageMetadata(buffer);

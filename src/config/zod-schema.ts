@@ -23,6 +23,14 @@ const NodeHostSchema = z
       })
       .strict()
       .optional(),
+    screenSnap: z
+      .object({
+        maxWidth: z.number().int().positive().optional(),
+        maxQuality: z.number().int().min(1).max(100).optional(),
+        maxBytes: z.number().int().positive().optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .optional();

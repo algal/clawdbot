@@ -10,7 +10,9 @@ const OPENROUTER_APP_HEADERS: Record<string, string> = {
   "X-Title": "OpenClaw",
 };
 const ANTHROPIC_CONTEXT_1M_BETA = "context-1m-2025-08-07";
+const ANTHROPIC_FAST_MODE_BETA = "fast-mode-2026-02-01";
 const ANTHROPIC_1M_MODEL_PREFIXES = ["claude-opus-4", "claude-sonnet-4"] as const;
+const ANTHROPIC_FAST_MODE_MODEL_IDS = new Set(["claude-opus-4-6", "claude-opus-4.6"]);
 // NOTE: We only force `store=true` for *direct* OpenAI Responses.
 // Codex responses (chatgpt.com/backend-api/codex/responses) require `store=false`.
 const OPENAI_RESPONSES_APIS = new Set(["openai-responses"]);
@@ -106,6 +108,7 @@ function createStreamFnWithExtraParams(
   baseStreamFn: StreamFn | undefined,
   extraParams: Record<string, unknown> | undefined,
   provider: string,
+  anthropicSpeed?: "fast",
 ): StreamFn | undefined {
   if (!extraParams || Object.keys(extraParams).length === 0) {
     return undefined;
@@ -146,13 +149,16 @@ function createStreamFnWithExtraParams(
       ? (extraParams.provider as Record<string, unknown>)
       : undefined;
 
-  if (Object.keys(streamParams).length === 0 && !providerRouting) {
+  if (Object.keys(streamParams).length === 0 && !providerRouting && !anthropicSpeed) {
     return undefined;
   }
 
   log.debug(`creating streamFn wrapper with params: ${JSON.stringify(streamParams)}`);
   if (providerRouting) {
     log.debug(`OpenRouter provider routing: ${JSON.stringify(providerRouting)}`);
+  }
+  if (anthropicSpeed) {
+    log.debug(`Anthropic speed mode enabled: ${anthropicSpeed}`);
   }
 
   const underlying = baseStreamFn ?? streamSimple;
@@ -165,6 +171,21 @@ function createStreamFnWithExtraParams(
           compat: { ...model.compat, openRouterRouting: providerRouting },
         } as unknown as typeof model)
       : model;
+    if (anthropicSpeed) {
+      const originalOnPayload = options?.onPayload;
+      return underlying(effectiveModel, context, {
+        ...streamParams,
+        ...options,
+        // pi-ai doesn't yet expose Anthropic's speed field directly, so inject
+        // it at payload-build time when fast mode is explicitly configured.
+        onPayload: (payload) => {
+          if (payload && typeof payload === "object") {
+            (payload as Record<string, unknown>).speed = anthropicSpeed;
+          }
+          originalOnPayload?.(payload);
+        },
+      });
+    }
     return underlying(effectiveModel, context, {
       ...streamParams,
       ...options,
@@ -360,6 +381,7 @@ function resolveAnthropicBetas(
   extraParams: Record<string, unknown> | undefined,
   provider: string,
   modelId: string,
+  anthropicSpeed?: "fast",
 ): string[] | undefined {
   if (provider !== "anthropic") {
     return undefined;
@@ -385,7 +407,47 @@ function resolveAnthropicBetas(
     }
   }
 
+  if (anthropicSpeed === "fast") {
+    betas.add(ANTHROPIC_FAST_MODE_BETA);
+  }
+
   return betas.size > 0 ? [...betas] : undefined;
+}
+
+function resolveAnthropicSpeed(
+  extraParams: Record<string, unknown> | undefined,
+  provider: string,
+  modelId: string,
+): "fast" | undefined {
+  if (provider !== "anthropic") {
+    return undefined;
+  }
+
+  const configured = extraParams?.speed;
+  if (configured == null) {
+    return undefined;
+  }
+  if (typeof configured !== "string") {
+    log.warn(`ignoring invalid speed param for ${provider}/${modelId}: ${typeof configured}`);
+    return undefined;
+  }
+
+  const normalized = configured.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+  if (normalized !== "fast") {
+    log.warn(`ignoring unsupported speed param for ${provider}/${modelId}: ${configured.trim()}`);
+    return undefined;
+  }
+
+  const normalizedModelId = modelId.trim().toLowerCase();
+  if (!ANTHROPIC_FAST_MODE_MODEL_IDS.has(normalizedModelId)) {
+    log.warn(`ignoring speed=fast for unsupported Anthropic model: ${provider}/${modelId}`);
+    return undefined;
+  }
+
+  return "fast";
 }
 
 function mergeAnthropicBetaHeader(
@@ -777,14 +839,20 @@ export function applyExtraParamsToAgent(
         )
       : undefined;
   const merged = Object.assign({}, extraParams, override);
-  const wrappedStreamFn = createStreamFnWithExtraParams(agent.streamFn, merged, provider);
+  const anthropicSpeed = resolveAnthropicSpeed(merged, provider, modelId);
+  const wrappedStreamFn = createStreamFnWithExtraParams(
+    agent.streamFn,
+    merged,
+    provider,
+    anthropicSpeed,
+  );
 
   if (wrappedStreamFn) {
     log.debug(`applying extraParams to agent streamFn for ${provider}/${modelId}`);
     agent.streamFn = wrappedStreamFn;
   }
 
-  const anthropicBetas = resolveAnthropicBetas(merged, provider, modelId);
+  const anthropicBetas = resolveAnthropicBetas(merged, provider, modelId, anthropicSpeed);
   if (anthropicBetas?.length) {
     log.debug(
       `applying Anthropic beta header for ${provider}/${modelId}: ${anthropicBetas.join(",")}`,

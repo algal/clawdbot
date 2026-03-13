@@ -1,6 +1,6 @@
 import type { StreamFn } from "@mariozechner/pi-agent-core";
 import type { Context, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { applyExtraParamsToAgent, resolveExtraParams } from "./pi-embedded-runner.js";
 
 describe("resolveExtraParams", () => {
@@ -207,6 +207,31 @@ describe("applyExtraParamsToAgent", () => {
 
     expect(calls).toHaveLength(1);
     return calls[0]?.headers;
+  }
+
+  function runAnthropicPayloadMutationCase(params: {
+    cfg: Record<string, unknown>;
+    modelId: string;
+    payload?: Record<string, unknown>;
+    options?: SimpleStreamOptions;
+  }) {
+    const payload = params.payload ?? { messages: [] };
+    const baseStreamFn: StreamFn = (_model, _context, options) => {
+      options?.onPayload?.(payload);
+      return {} as ReturnType<StreamFn>;
+    };
+    const agent = { streamFn: baseStreamFn };
+    applyExtraParamsToAgent(agent, params.cfg, "anthropic", params.modelId);
+
+    const model = {
+      api: "anthropic-messages",
+      provider: "anthropic",
+      id: params.modelId,
+    } as Model<"anthropic-messages">;
+    const context: Context = { messages: [] };
+    void agent.streamFn?.(model, context, params.options ?? {});
+
+    return payload;
   }
 
   it("does not inject reasoning when thinkingLevel is off (default) for OpenRouter", () => {
@@ -901,6 +926,88 @@ describe("applyExtraParamsToAgent", () => {
       "anthropic-beta":
         "prompt-caching-2024-07-31,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14,files-api-2025-04-14,context-1m-2025-08-07",
     });
+  });
+
+  it("injects speed=fast into Anthropic Opus 4.6 payloads when configured", () => {
+    const payload = runAnthropicPayloadMutationCase({
+      cfg: buildAnthropicModelConfig("anthropic/claude-opus-4-6", { speed: "fast" }),
+      modelId: "claude-opus-4-6",
+    });
+
+    expect(payload.speed).toBe("fast");
+  });
+
+  it("preserves downstream onPayload hooks when injecting Anthropic speed=fast", () => {
+    const downstream = vi.fn();
+    const payload = runAnthropicPayloadMutationCase({
+      cfg: buildAnthropicModelConfig("anthropic/claude-opus-4-6", { speed: "fast" }),
+      modelId: "claude-opus-4-6",
+      options: { onPayload: downstream },
+    });
+
+    expect(payload.speed).toBe("fast");
+    expect(downstream).toHaveBeenCalledOnce();
+    expect((downstream.mock.calls[0]?.[0] as Record<string, unknown>)?.speed).toBe("fast");
+  });
+
+  it("adds Anthropic fast-mode beta header when speed=fast is enabled for Opus 4.6", () => {
+    const headers = runAnthropicHeaderCase({
+      cfg: buildAnthropicModelConfig("anthropic/claude-opus-4-6", { speed: "fast" }),
+      modelId: "claude-opus-4-6",
+      options: {
+        apiKey: "sk-ant-api03-test",
+        headers: { "X-Custom": "1" },
+      },
+    });
+
+    expect(headers).toEqual({
+      "X-Custom": "1",
+      "anthropic-beta":
+        "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14,fast-mode-2026-02-01",
+    });
+  });
+
+  it("ignores speed=fast for non-Opus Anthropic models", () => {
+    const payload = runAnthropicPayloadMutationCase({
+      cfg: buildAnthropicModelConfig("anthropic/claude-sonnet-4-6", { speed: "fast" }),
+      modelId: "claude-sonnet-4-6",
+    });
+    const headers = runAnthropicHeaderCase({
+      cfg: buildAnthropicModelConfig("anthropic/claude-sonnet-4-6", { speed: "fast" }),
+      modelId: "claude-sonnet-4-6",
+      options: { headers: { "X-Custom": "1" } },
+    });
+
+    expect(payload).not.toHaveProperty("speed");
+    expect(headers).toEqual({ "X-Custom": "1" });
+  });
+
+  it("ignores speed=fast for non-Anthropic providers", () => {
+    const payload = runResponsesPayloadMutationCase({
+      applyProvider: "openai",
+      applyModelId: "gpt-4o",
+      cfg: {
+        agents: {
+          defaults: {
+            models: {
+              "openai/gpt-4o": {
+                params: {
+                  speed: "fast",
+                },
+              },
+            },
+          },
+        },
+      },
+      model: {
+        api: "openai-completions",
+        provider: "openai",
+        id: "gpt-4o",
+      } as Model<"openai-completions">,
+      payload: {},
+    });
+
+    expect(payload).not.toHaveProperty("speed");
   });
 
   it("ignores context1m for non-Opus/Sonnet Anthropic models", () => {
